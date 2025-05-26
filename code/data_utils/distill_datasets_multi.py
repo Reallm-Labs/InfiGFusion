@@ -89,6 +89,8 @@ class DistillDataset(Dataset):
         self.teacher_tokenizers = teacher_tokenizers
         self.max_length = args.max_length
         self.max_prompt_length = args.max_prompt_length
+        self.args.data_dir_list = self.args.data_dir.split(",")                                                                  8        
+        self.args.feats_folder_list = self.args.feats_folder.split(",") 
         self.dataset = self._load_and_process_data()
 
     def __len__(self):
@@ -97,139 +99,155 @@ class DistillDataset(Dataset):
     def __getitem__(self, index):
         return self.dataset[index]
     
-    def _load_and_process_data(self):
+    def _load_and_tokenize_same_temp(self, raw_data, _feats_folder):
         dataset = []
-        path = os.path.join(self.args.data_dir, f"{self.split}.jsonl")
-
-        if os.path.exists(path) and not self.args.diff_templates:
-            with open(path) as f:
-                raw_data = [json.loads(l) for l in f.readlines()]
-                self.answers = [x["output"] if isinstance(x["output"], list) else [x["output"]] for x in raw_data]
+        self.answers = [x["output"] if isinstance(x["output"], list) else [x["output"]] for x in raw_data]
+        
+        if self.args.debug:
+            log_rank('For debug, only load small parts of data')
+            raw_data = raw_data[:100]
+            self.answers = self.answers[:100]
+        # scaling sampling dataset, usually full data
+        if self.args.data_scale_factor < 1.0:
+            ori_data_num = len(raw_data)
+            new_data_num = int(ori_data_num * self.args.data_scale_factor)
+            sample_indices = random.sample(range(ori_data_num), new_data_num)
+            # 使用相同的索引同时更新 raw_data 和 self.answers
+            raw_data = [raw_data[i] for i in sample_indices]
+            self.answers = [self.answers[i] for i in sample_indices]
             
-            if self.args.debug:
-                log_rank('For debug, only load small parts of data')
-                raw_data = raw_data[:100]
-                self.answers = self.answers[:100]
-            # scaling sampling dataset, usually full data
-            if self.args.data_scale_factor < 1.0:
-                ori_data_num = len(raw_data)
-                new_data_num = int(ori_data_num * self.args.data_scale_factor)
-                sample_indices = random.sample(range(ori_data_num), new_data_num)
-                # 使用相同的索引同时更新 raw_data 和 self.answers
-                raw_data = [raw_data[i] for i in sample_indices]
-                self.answers = [self.answers[i] for i in sample_indices]
-                
-            log_rank("Processing dataset for student model (and all teacher models)...")  
-            seg = np.iinfo(np.int32).max * 2 + 1      # [seg] has been removed in `process_lm`
-            cur_idx = 0
-            for data in tqdm(raw_data, disable=(dist.get_rank() != 0)):
-                student_prompt_ids = self.student_tokenizer.encode(
+        log_rank("Processing dataset for student model (and all teacher models)...")  
+        seg = np.iinfo(np.int32).max * 2 + 1      # [seg] has been removed in `process_lm`
+        cur_idx = 0
+        for data in tqdm(raw_data, disable=(dist.get_rank() != 0)):
+            student_prompt_ids = self.student_tokenizer.encode(
+                data["prompt"], add_special_tokens=False
+            )
+            student_prompt_ids = student_prompt_ids[:self.max_prompt_length]
+            student_response_ids = self.student_tokenizer.encode(
+                data["output"], add_special_tokens=False
+            )
+            # add eos behind each response
+            student_response_ids = student_response_ids \
+                                    + [self.student_tokenizer.eos_token_id]
+            tokenized_data = {
+                "student_input_ids": student_prompt_ids + [seg] + student_response_ids,
+            }
+    
+            # support teachers with different tokenziers
+            for model_type, tokenizer in self.teacher_tokenizers.items():
+                if tokenizer is None:
+                    continue # for tokenizers that are not initilized
+                    
+                teacher_prompt_ids = tokenizer.encode(
                     data["prompt"], add_special_tokens=False
                 )
-                student_prompt_ids = student_prompt_ids[:self.max_prompt_length]
-                student_response_ids = self.student_tokenizer.encode(
+                teacher_prompt_ids = teacher_prompt_ids[:self.max_prompt_length]
+                teacher_response_ids = tokenizer.encode(
                     data["output"], add_special_tokens=False
                 )
-                # add eos behind each response
-                student_response_ids = student_response_ids \
-                                     + [self.student_tokenizer.eos_token_id]
-                tokenized_data = {
-                    "student_input_ids": student_prompt_ids + [seg] + student_response_ids,
-                }
-        
-                # support teachers with different tokenziers
-                for model_type, tokenizer in self.teacher_tokenizers.items():
-                    if tokenizer is None:
-                        continue # for tokenizers that are not initilized
-                        
-                    teacher_prompt_ids = tokenizer.encode(
-                        data["prompt"], add_special_tokens=False
-                    )
-                    teacher_prompt_ids = teacher_prompt_ids[:self.max_prompt_length]
-                    teacher_response_ids = tokenizer.encode(
-                        data["output"], add_special_tokens=False
-                    )
-                    teacher_response_ids = teacher_response_ids \
-                                            + [tokenizer.eos_token_id]
-                    tokenized_data[f"teacher_{model_type}_input_ids"] = \
-                        teacher_prompt_ids + [seg] + teacher_response_ids
+                teacher_response_ids = teacher_response_ids \
+                                        + [tokenizer.eos_token_id]
+                tokenized_data[f"teacher_{model_type}_input_ids"] = \
+                    teacher_prompt_ids + [seg] + teacher_response_ids
+                tokenized_data["feats_folder"]= _feats_folder
 
-                # additional add `index` for later loading teacher hidden states and logits
-                if self.args.data_scale_factor < 1.0:
-                    tokenized_data[f"data_index"] = sample_indices[cur_idx]
-                else:
-                    tokenized_data[f"data_index"] = cur_idx
-                cur_idx += 1
-                dataset.append(tokenized_data)
-            return dataset
-        elif os.path.exists(path) and self.args.diff_templates:
+            # additional add `index` for later loading teacher hidden states and logits
+            if self.args.data_scale_factor < 1.0:
+                tokenized_data[f"data_index"] = sample_indices[cur_idx]
+            else:
+                tokenized_data[f"data_index"] = cur_idx
+            cur_idx += 1
+            dataset.append(tokenized_data)
+        return dataset
+    def _load_and_tokenize_diff_temp(self, raw_data, _feats_folder):
+        dataset = []
+ 
+        # for multi templates, the student gt is geneerated_solution (which is the typo, not fix now)
+        self.answers = [x["generated_solution"] if isinstance(x["generated_solution"], list) else [x["generated_solution"]] for x in raw_data]
+        
+        if self.args.debug:
+            log_rank('For debug, only load small parts of data')
+            raw_data = raw_data[:100]
+            self.answers = self.answers[:100]
+        # scaling sampling dataset, usually full data
+        if self.args.data_scale_factor < 1.0:
+            ori_data_num = len(raw_data)
+            new_data_num = int(ori_data_num * self.args.data_scale_factor)
+            sample_indices = random.sample(range(ori_data_num), new_data_num)
+            # 使用相同的索引同时更新 raw_data 和 self.answers
+            raw_data = [raw_data[i] for i in sample_indices]
+            self.answers = [self.answers[i] for i in sample_indices]
+            
+        log_rank("Processing dataset for student model (and all teacher models)...")  
+        seg = np.iinfo(np.int32).max * 2 + 1      # [seg] has been removed in `process_lm`
+        cur_idx = 0
+        for data in tqdm(raw_data, disable=(dist.get_rank() != 0)):
+
+            student_prompt_ids = self.student_tokenizer.encode(
+                data[f"prompt_{self.student_template_suffix}"], add_special_tokens=False
+            )
+            student_prompt_ids = student_prompt_ids[:self.max_prompt_length]
+            # for multi templates, the student gt is geneerated_solution (which is the typo, not fix now)
+            student_response_ids = self.student_tokenizer.encode(
+                data["generated_solution"], add_special_tokens=False
+            )
+            # add eos behind each response
+            student_response_ids = student_response_ids \
+                                    + [self.student_tokenizer.eos_token_id]
+            tokenized_data = {
+                "student_input_ids": student_prompt_ids + [seg] + student_response_ids,
+            }
+    
+            # support teachers with different tokenziers
+            for model_type, tokenizer in self.teacher_tokenizers.items():
+                tec_template_str = self.template_suffix_to_model_type[model_type]
+                cur_tec_template = self.teacher_templates_mapping[tec_template_str]
+                if tokenizer is None:
+                    continue # for tokenizers that are not initilized
+                    
+                teacher_prompt_ids = tokenizer.encode(
+                    data[f"prompt_{cur_tec_template}"], add_special_tokens=False
+                )
+                teacher_prompt_ids = teacher_prompt_ids[:self.max_prompt_length]
+                teacher_response_ids = tokenizer.encode(
+                    data[f"output_{cur_tec_template}"], add_special_tokens=False
+                )
+                teacher_response_ids = teacher_response_ids \
+                                        + [tokenizer.eos_token_id]
+                tokenized_data[f"teacher_{model_type}_input_ids"] = \
+                    teacher_prompt_ids + [seg] + teacher_response_ids
+                tokenized_data["feats_folder"]= _feats_folder
+
+            # additional add `index` for later loading teacher hidden states and logits
+            if self.args.data_scale_factor < 1.0:
+                tokenized_data[f"data_index"] = sample_indices[cur_idx]
+            else:
+                tokenized_data[f"data_index"] = cur_idx
+            cur_idx += 1
+            dataset.append(tokenized_data)
+
+    
+        return dataset
+    
+    def _load_and_process_data(self):
+        dataset = []
+        for _data_dir, _feats_folder in zip(self.args.data_dir_list, self.args.feats_folder_list):
+
+            path = os.path.join(_data_dir, f"{self.split}.jsonl")
+            assert os.path.exists(path), f"Error: The path '{path}' does not exist!"
             with open(path) as f:
                 raw_data = [json.loads(l) for l in f.readlines()]
-                # for multi templates, the student gt is geneerated_solution (which is the typo, not fix now)
-                self.answers = [x["generated_solution"] if isinstance(x["generated_solution"], list) else [x["generated_solution"]] for x in raw_data]
             
-            if self.args.debug:
-                log_rank('For debug, only load small parts of data')
-                raw_data = raw_data[:100]
-                self.answers = self.answers[:100]
-            # scaling sampling dataset, usually full data
-            if self.args.data_scale_factor < 1.0:
-                ori_data_num = len(raw_data)
-                new_data_num = int(ori_data_num * self.args.data_scale_factor)
-                sample_indices = random.sample(range(ori_data_num), new_data_num)
-                # 使用相同的索引同时更新 raw_data 和 self.answers
-                raw_data = [raw_data[i] for i in sample_indices]
-                self.answers = [self.answers[i] for i in sample_indices]
-                
-            log_rank("Processing dataset for student model (and all teacher models)...")  
-            seg = np.iinfo(np.int32).max * 2 + 1      # [seg] has been removed in `process_lm`
-            cur_idx = 0
-            for data in tqdm(raw_data, disable=(dist.get_rank() != 0)):
+            if self.args.diff_templates:
+                dataset.extend(self._load_and_tokenize_diff_temp(raw_data, _feats_folder))
+            else:
+                dataset.extend(self._load_and_tokenize_same_temp(raw_data, _feats_folder))   
 
-                student_prompt_ids = self.student_tokenizer.encode(
-                    data[f"prompt_{self.student_template_suffix}"], add_special_tokens=False
-                )
-                student_prompt_ids = student_prompt_ids[:self.max_prompt_length]
-                # for multi templates, the student gt is geneerated_solution (which is the typo, not fix now)
-                student_response_ids = self.student_tokenizer.encode(
-                    data["generated_solution"], add_special_tokens=False
-                )
-                # add eos behind each response
-                student_response_ids = student_response_ids \
-                                     + [self.student_tokenizer.eos_token_id]
-                tokenized_data = {
-                    "student_input_ids": student_prompt_ids + [seg] + student_response_ids,
-                }
         
-                # support teachers with different tokenziers
-                for model_type, tokenizer in self.teacher_tokenizers.items():
-                    tec_template_str = self.template_suffix_to_model_type[model_type]
-                    cur_tec_template = self.teacher_templates_mapping[tec_template_str]
-                    if tokenizer is None:
-                        continue # for tokenizers that are not initilized
-                        
-                    teacher_prompt_ids = tokenizer.encode(
-                        data[f"prompt_{cur_tec_template}"], add_special_tokens=False
-                    )
-                    teacher_prompt_ids = teacher_prompt_ids[:self.max_prompt_length]
-                    teacher_response_ids = tokenizer.encode(
-                        data[f"output_{cur_tec_template}"], add_special_tokens=False
-                    )
-                    teacher_response_ids = teacher_response_ids \
-                                            + [tokenizer.eos_token_id]
-                    tokenized_data[f"teacher_{model_type}_input_ids"] = \
-                        teacher_prompt_ids + [seg] + teacher_response_ids
+        return dataset
 
-                # additional add `index` for later loading teacher hidden states and logits
-                if self.args.data_scale_factor < 1.0:
-                    tokenized_data[f"data_index"] = sample_indices[cur_idx]
-                else:
-                    tokenized_data[f"data_index"] = cur_idx
-                cur_idx += 1
-                dataset.append(tokenized_data)
-            return dataset
-        else:
-            raise FileNotFoundError(f"No such file named {path}")
+
         
     def _process_lm(
         self, i, samp, model_data, no_model_data, gen_data, 
@@ -272,9 +290,13 @@ class DistillDataset(Dataset):
             # for multiple teacher data loading
             cur_data_index = samp["data_index"]
             folder_index = int(cur_data_index) // 1000
-            data_path = os.path.join("/s1/wangyuanyi/", self.args.feats_folder, \
+            # data_path = os.path.join("/s1/wangyuanyi/", self.args.feats_folder, \
+            #    f"{self.teacher_model_name_and_type[model_type]}_{self.args.merge_folder}", 
+            #    f"{folder_index:05d}", f"{cur_data_index:08d}.npz")
+            data_path = os.path.join(samp['feats_folder'], \
                f"{self.teacher_model_name_and_type[model_type]}_{self.args.merge_folder}", 
                f"{folder_index:05d}", f"{cur_data_index:08d}.npz")
+
             
             teacher_feats_data = np.load(data_path, allow_pickle=True)
             # decompress the data and convert to pytorch tensor
