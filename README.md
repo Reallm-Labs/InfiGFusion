@@ -5,8 +5,8 @@ InfiGFusion: Graph-on-Logits Distillation via Efficient Gromov-Wasserstein for M
 <h4 align="center">
 
 [![Arxiv](https://img.shields.io/badge/Arxiv-D14836?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/pdf/2505.13893) 
-[![HuggingFace](https://img.shields.io/badge/HuggingFace-FF9900?style=for-the-badge&logo=huggingface&logoColor=white)](https://arxiv.org/pdf/2505.13893)
-[![HuggingFace Model](https://img.shields.io/badge/HuggingFace%20Model-FF9900?style=for-the-badge&logo=huggingface&logoColor=white)](https://arxiv.org/pdf/2505.13893)
+[![HuggingFace](https://img.shields.io/badge/HuggingFace-FF9900?style=for-the-badge&logo=huggingface&logoColor=white)](https://huggingface.co/Reallm-Labs/InfiGFusion-14B)
+[![HuggingFace Model](https://img.shields.io/badge/HuggingFace%20Model-FF9900?style=for-the-badge&logo=huggingface&logoColor=white)](https://huggingface.co/Reallm-Labs/InfiGFusion-14B/tree/main/models)
   
 </h4>
 
