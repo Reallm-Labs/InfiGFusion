@@ -31,7 +31,7 @@ InfiGFusion: Graph-on-Logits Distillation via Efficient Gromov-Wasserstein for M
 | **Fusing time**         | 195 hours                                                                       |
 | **Fusing data**         | 520M tokens                                                                   |
 | **Outputs**             | Generated text in response to input                                           |
-| **Status**              | Static model trained on an offline dataset                                    |
+| **Status**              | Pivot model trained on an offline dataset                                    |
 | **License**             | MIT                                                                         |
 
 ## 🩺 Intended Use 
